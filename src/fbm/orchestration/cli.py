@@ -5,6 +5,7 @@ from fbm.markets.price_utils import (
     remove_vig_two_way,
     american_to_decimal,
 )
+from fbm.markets.kelly import kelly_fractional
 
 def daily(season: int, week: int, league: str = "NFL"):
     print(f"[fbm] Running daily pipeline | league={league} season={season} week={week}")
@@ -20,8 +21,8 @@ def daily(season: int, week: int, league: str = "NFL"):
     print(f" - gold   → {gold}")
 
     # --- Demo: moneyline two-way market (stub values) ---
-    home_ml = -120  # example: home favorite -120
-    away_ml = +110  # example: away underdog +110
+    home_ml = -120
+    away_ml = +110
 
     p_home_mkt = implied_prob_from_american(home_ml)
     p_away_mkt = implied_prob_from_american(away_ml)
@@ -32,7 +33,17 @@ def daily(season: int, week: int, league: str = "NFL"):
     print(f" - Away ML {away_ml:+d} → implied={p_away_mkt:.4f}, decimal={american_to_decimal(away_ml):.4f}")
     print(f" - De-vigged fair probs → home={p_home_fair:.4f}, away={p_away_fair:.4f} (sum={p_home_fair+p_away_fair:.4f})")
 
-    # stubbed pipeline steps
+    # --- Kelly demo: suppose model says home wins 56% vs fair ~p_home_fair ---
+    model_p_home = 0.56
+    dec_home = american_to_decimal(home_ml)
+    bankroll = 10_000.0
+    stake = kelly_fractional(model_p_home, dec_home, bankroll=bankroll, fraction=0.33)
+    ev_per_dollar = model_p_home * (dec_home - 1) - (1 - model_p_home)
+
+    print("\nKelly demo:")
+    print(f" - Model P(home)={model_p_home:.3f}, Market fair P(home)≈{p_home_fair:.3f}")
+    print(f" - EV per $1: {ev_per_dollar:.4f} → Stake (1/3 Kelly on ${bankroll:,.0f}) = ${stake:,.2f}")
+
     print("\nPipeline (stub):")
     print(" - ingest odds/schedules -> bronze")
     print(" - normalize -> silver")
