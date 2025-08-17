@@ -1,7 +1,20 @@
 import argparse
+from fbm.utils.partitions import part_path
 
 def daily(season: int, week: int, league: str = "NFL"):
     print(f"[fbm] Running daily pipeline | league={league} season={season} week={week}")
+
+    dataroot = "./data"
+    bronze = part_path(dataroot, "bronze", league, season, week)
+    silver = part_path(dataroot, "silver", league, season, week)
+    gold   = part_path(dataroot, "gold",   league, season, week)
+
+    print("Planned output locations:")
+    print(f" - bronze → {bronze}")
+    print(f" - silver → {silver}")
+    print(f" - gold   → {gold}")
+
+    # stubbed pipeline steps
     print(" - (stub) ingest odds/schedules -> bronze")
     print(" - (stub) normalize -> silver")
     print(" - (stub) build features -> gold")
