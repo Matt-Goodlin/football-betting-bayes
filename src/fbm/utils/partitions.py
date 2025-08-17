@@ -1,6 +1,8 @@
+# src/fbm/utils/partitions.py
 from pathlib import Path
+from typing import Optional
 
-def part_path(root: str, layer: str, league: str, season: int, week: int | None = None) -> Path:
+def part_path(root: str, layer: str, league: str, season: int, week: Optional[int] = None) -> Path:
     """
     Build a data path like:
     data/bronze/league=NFL/season=2025/week=1
