@@ -6,11 +6,17 @@ from fbm.markets.price_utils import (
     american_to_decimal,
 )
 from fbm.markets.kelly import kelly_fractional
+from fbm.config.loader import load_config
 
 def daily(season: int, week: int, league: str = "NFL"):
-    print(f"[fbm] Running daily pipeline | league={league} season={season} week={week}")
+    cfg = load_config()
+    bankroll = cfg["betting"]["bankroll"]
+    kelly_frac = cfg["betting"]["kelly_fraction"]
 
-    dataroot = "./data"
+    print(f"[fbm] Running daily pipeline | league={league} season={season} week={week}")
+    print(f"[config] bankroll=${bankroll:,.0f}, kelly_fraction={kelly_frac}")
+
+    dataroot = cfg["paths"]["datalake"]
     bronze = part_path(dataroot, "bronze", league, season, week)
     silver = part_path(dataroot, "silver", league, season, week)
     gold   = part_path(dataroot, "gold",   league, season, week)
@@ -31,18 +37,17 @@ def daily(season: int, week: int, league: str = "NFL"):
     print("\nOdds demo (moneyline):")
     print(f" - Home ML {home_ml:+d} → implied={p_home_mkt:.4f}, decimal={american_to_decimal(home_ml):.4f}")
     print(f" - Away ML {away_ml:+d} → implied={p_away_mkt:.4f}, decimal={american_to_decimal(away_ml):.4f}")
-    print(f" - De-vigged fair probs → home={p_home_fair:.4f}, away={p_away_fair:.4f} (sum={p_home_fair+p_away_fair:.4f})")
+    print(f" - De-vigged fair probs → home={p_home_fair:.4f}, away={p_away_fair:.4f}")
 
-    # --- Kelly demo: suppose model says home wins 56% vs fair ~p_home_fair ---
+    # --- Kelly demo using config ---
     model_p_home = 0.56
     dec_home = american_to_decimal(home_ml)
-    bankroll = 10_000.0
-    stake = kelly_fractional(model_p_home, dec_home, bankroll=bankroll, fraction=0.33)
+    stake = kelly_fractional(model_p_home, dec_home, bankroll=bankroll, fraction=kelly_frac)
     ev_per_dollar = model_p_home * (dec_home - 1) - (1 - model_p_home)
 
     print("\nKelly demo:")
     print(f" - Model P(home)={model_p_home:.3f}, Market fair P(home)≈{p_home_fair:.3f}")
-    print(f" - EV per $1: {ev_per_dollar:.4f} → Stake (1/3 Kelly on ${bankroll:,.0f}) = ${stake:,.2f}")
+    print(f" - EV per $1: {ev_per_dollar:.4f} → Stake ({kelly_frac:.2f} Kelly) = ${stake:,.2f}")
 
     print("\nPipeline (stub):")
     print(" - ingest odds/schedules -> bronze")

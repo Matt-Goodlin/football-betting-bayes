@@ -1,0 +1,6 @@
+paths:
+  datalake: "./data"
+
+betting:
+  bankroll: 10000
+  kelly_fraction: 0.33
