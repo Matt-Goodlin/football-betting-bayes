@@ -5,7 +5,7 @@ on:
     # UTC times; adjust as you like (13:00 UTC ≈ 9am ET during EDT)
     - cron: "0 13 * * *"        # Daily 9am ET
     - cron: "0 14 * * 4"        # Thu 10am ET (TNF morning)
-    - cron: "0 14 * * 7"        # Sun 10am ET (gameday morning)
+    - cron: "0 14 * * SUN"        # Sun 10am ET (gameday morning)
   workflow_dispatch: {}
 
 jobs:
