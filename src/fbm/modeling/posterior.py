@@ -7,9 +7,12 @@ If X ~ Normal(mean, sigma), then:
 - For spreads: a = spread_line (home - away)
 - For totals:  a = total_line (home + away)
 
-No external deps; uses an error-function CDF.
+Includes both closed-form CDF helpers and Monte Carlo simulators.
+Compatible with Python 3.9.
 """
 from math import erf, sqrt
+from typing import Optional
+import numpy as np
 
 SQRT2 = sqrt(2.0)
 
@@ -44,3 +47,35 @@ def prob_total_over(mean_total: float, sigma_total: float, total_line: float) ->
     P(Over total) under Normal model for (Home + Away) ~ N(mean_total, sigma_total^2).
     """
     return prob_over_normal(mean_total, sigma_total, total_line)
+
+# ---------------------------
+# Monte Carlo posterior sims
+# ---------------------------
+
+def simulate_cover_spread(
+    mean_diff: float,
+    sigma: float,
+    spread: float,
+    n: int = 10000,
+    seed: Optional[int] = None
+) -> float:
+    """
+    Monte Carlo estimate of P(home margin > spread) where margin ~ N(mean_diff, sigma^2).
+    """
+    rng = np.random.default_rng(seed)
+    sims = rng.normal(loc=mean_diff, scale=sigma, size=n)
+    return float(np.mean(sims > spread))
+
+def simulate_total_over(
+    total_mean: float,
+    sigma_total: float,
+    line: float,
+    n: int = 10000,
+    seed: Optional[int] = None
+) -> float:
+    """
+    Monte Carlo estimate of P(total points > line) where total ~ N(total_mean, sigma_total^2).
+    """
+    rng = np.random.default_rng(seed)
+    sims = rng.normal(loc=total_mean, scale=sigma_total, size=n)
+    return float(np.mean(sims > line))
