@@ -4,3 +4,11 @@ paths:
 betting:
   bankroll: 10000
   kelly_fraction: 0.33
+  min_edge_pct: 0.02
+  min_kelly_stake: 25
+
+model:
+  hfa_points: 2.0
+  sigma_diff: 13.0
+  sigma_total: 10.0
+  league_total_mean: 45.0
