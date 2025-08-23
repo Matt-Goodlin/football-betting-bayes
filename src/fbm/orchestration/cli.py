@@ -1,3 +1,4 @@
+# src/fbm/orchestration/cli.py
 import argparse
 from pathlib import Path
 
@@ -14,17 +15,11 @@ from fbm.markets.price_utils import (
 from fbm.markets.kelly import kelly_fractional
 from fbm.markets.edge import ev_and_edge
 from fbm.modeling.baseline import BaselineModel
+from fbm.modeling.ratings_csv import load_ratings_csv
 from fbm.utils.csvout import write_csv
 
 
 def _ensure_sample_csv(bronze_path: Path) -> Path:
-    """
-    Create a tiny sample CSV if none exists yet.
-    Schema:
-      game_id,home_team,away_team,home_ml,away_ml,
-      home_spread,home_spread_price,away_spread_price,
-      total_line,over_price,under_price
-    """
     csv_path = bronze_path / "odds.csv"
     if not csv_path.exists():
         csv_path.write_text(
@@ -67,10 +62,15 @@ def daily(season: int, week: int, league: str, config_path: str):
     ensure_dir(silver)
     ensure_dir(gold)
 
-    # ---- Baseline model (ratings empty for now; params from YAML if present)
+    # ---- Load ratings from silver (optional)
+    ratings_path = Path(silver) / "teams" / "ratings.csv"
+    ratings = load_ratings_csv(ratings_path)
+    print(f"[ratings] loaded {len(ratings)} team ratings from {ratings_path}")
+
+    # ---- Baseline model (params from YAML if present)
     model_cfg = cfg.get("model", {})
     model = BaselineModel(
-        ratings={},  # can be replaced by a ratings loader later
+        ratings=ratings,
         hfa_points=float(model_cfg.get("hfa_points", 2.0)),
         sigma_diff=float(model_cfg.get("sigma_diff", 13.0)),
         sigma_total=float(model_cfg.get("sigma_total", 10.0)),
@@ -205,7 +205,10 @@ def daily(season: int, week: int, league: str, config_path: str):
 
     # ---- Save tickets to gold CSV
     out_csv = Path(gold) / "tickets.csv"
-    write_csv(out_csv, tickets, headers)
+    write_csv(out_csv, tickets, [
+        "game_id","market","side_or_bet","odds_am","odds_dec",
+        "line","fair_prob","model_prob","edge","ev_per_dollar","kelly_stake",
+    ])
     print(f"\nSaved {len(tickets)} tickets to {out_csv}")
 
     print("\nPipeline (stub):")
