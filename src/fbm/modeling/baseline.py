@@ -1,18 +1,13 @@
-from math import erf, sqrt
+import math
 from typing import Dict, Optional
-
-_SQRT2 = sqrt(2.0)
-
-def _norm_cdf(z: float) -> float:
-    return 0.5 * (1.0 + erf(z / _SQRT2))
 
 class BaselineModel:
     """
-    Super-simple baseline:
-      - Team rating dict (points), default 0 for unseen teams.
-      - HFA in points, default 2.0.
-      - sigma_diff: stdev of point differential (e.g., 13).
-      - sigma_total: stdev of totals (e.g., 10).
+    Minimal baseline model used by the CLI:
+      - team 'ratings' on a point scale (higher = stronger)
+      - hfa_points: home-field advantage added to home rating
+      - sigma_diff: stdev (points) of score differential
+      - sigma_total: stdev (points) of total score
     """
 
     def __init__(
@@ -21,32 +16,37 @@ class BaselineModel:
         hfa_points: float = 2.0,
         sigma_diff: float = 13.0,
         sigma_total: float = 10.0,
-    ):
-        self.ratings = ratings or {}
-        self.hfa = hfa_points
-        self.sd_diff = sigma_diff
-        self.sd_total = sigma_total
+    ) -> None:
+        self.ratings: Dict[str, float] = ratings or {}
+        self.hfa_points: float = float(hfa_points)
+        self.sigma_diff: float = float(sigma_diff)
+        self.sigma_total: float = float(sigma_total)
 
-    def _rating(self, team: str) -> float:
-        return self.ratings.get(team, 0.0)
+    def rating(self, team: str) -> float:
+        return float(self.ratings.get(team, 0.0))
 
-    def mean_diff(self, home_team: str, away_team: str) -> float:
-        """Expected point differential: Home - Away."""
-        return (self._rating(home_team) - self._rating(away_team)) + self.hfa
+    @staticmethod
+    def _phi(x: float) -> float:
+        """Standard normal CDF Φ(x)."""
+        # Φ(x) = 0.5 * (1 + erf(x / sqrt(2)))
+        return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
     def win_prob_home(self, home_team: str, away_team: str) -> float:
-        """P(Home wins) under Normal(diff)."""
-        mu = self.mean_diff(home_team, away_team)
-        z = (0.0 - mu) / self.sd_diff
-        return 1.0 - _norm_cdf(z)
+        """
+        P(home_score - away_score > 0) when diff ~ Normal(mean, sigma_diff)
+        mean = (rating_home - rating_away + hfa_points)
+        """
+        mean = self.rating(home_team) - self.rating(away_team) + self.hfa_points
+        if self.sigma_diff <= 0:
+            # Degenerate; treat as coin flip if no variance
+            return 0.5
+        z = mean / self.sigma_diff
+        # P(diff > 0) = Φ(z)
+        return self._phi(z)
 
-    def cover_prob_home(self, home_team: str, away_team: str, spread_line: float) -> float:
-        """P(Home - Away > spread_line)."""
-        mu = self.mean_diff(home_team, away_team)
-        z = (spread_line - mu) / self.sd_diff
-        return 1.0 - _norm_cdf(z)
-
-    def over_prob(self, total_line: float, league_total_mean: float = 45.0) -> float:
-        """P(Total > line) with a fixed league total mean."""
-        z = (total_line - league_total_mean) / self.sd_total
-        return 1.0 - _norm_cdf(z)
+    def __repr__(self) -> str:
+        return (
+            f"BaselineModel(hfa_points={self.hfa_points}, "
+            f"sigma_diff={self.sigma_diff}, sigma_total={self.sigma_total}, "
+            f"ratings={len(self.ratings)} teams)"
+        )
