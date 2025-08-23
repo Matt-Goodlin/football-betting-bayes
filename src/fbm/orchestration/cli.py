@@ -1,4 +1,5 @@
 import argparse
+import os
 from pathlib import Path
 
 from fbm.utils.partitions import part_path
@@ -7,6 +8,7 @@ from fbm.config.loader import load_config
 
 from fbm.data.ingest.odds_csv import load_odds_csv
 from fbm.data.ingest.results_csv import load_results_dir
+from fbm.data.fetch.theoddsapi import fetch_odds_to_csv, fetch_recent_scores_to_csv
 
 from fbm.markets.price_utils import (
     implied_prob_from_american,
@@ -23,6 +25,11 @@ from fbm.modeling.posterior import prob_cover_spread, prob_total_over
 from fbm.utils.csvout import write_csv
 
 
+SPORT_SLUG = {
+    "NFL": "americanfootball_nfl",
+    "CFB": "americanfootball_ncaaf",
+}
+
 def _ensure_sample_odds_csv(bronze_path: Path) -> Path:
     csv_path = bronze_path / "odds.csv"
     if not csv_path.exists():
@@ -34,7 +41,6 @@ def _ensure_sample_odds_csv(bronze_path: Path) -> Path:
         )
         print(f"[fbm] Created sample odds file at {csv_path}")
     return csv_path
-
 
 def _ensure_sample_results_csv(season_silver_path: Path) -> Path:
     games_dir = season_silver_path / "games"
@@ -50,7 +56,6 @@ def _ensure_sample_results_csv(season_silver_path: Path) -> Path:
         print(f"[fbm] Created sample results file at {csv_path}")
     return csv_path
 
-
 def _write_ratings_csv(path: Path, ratings: dict) -> None:
     lines = ["team,rating"]
     for team in sorted(ratings.keys()):
@@ -58,9 +63,10 @@ def _write_ratings_csv(path: Path, ratings: dict) -> None:
     ensure_dir(path.parent)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-
-def daily(season: int, week: int, league: str, config_path: str, mc_n: int = None, mc_seed: int = None,
-          notify_ifttt: bool = False, notify_top_n: int = 3):
+def daily(season: int, week: int, league: str, config_path: str,
+          mc_n: int = None, mc_seed: int = None,
+          notify_ifttt: bool = False, notify_top_n: int = 3,
+          use_live: bool = True, scores_days: int = 14):
     cfg = load_config(config_path)
     bankroll = float(cfg["betting"]["bankroll"])
     kelly_frac = float(cfg["betting"]["kelly_fraction"])
@@ -90,16 +96,33 @@ def daily(season: int, week: int, league: str, config_path: str, mc_n: int = Non
 
     season_silver = part_path(dataroot, "silver", league, season, None)
     ensure_dir(Path(season_silver) / "teams")
+    ensure_dir(Path(season_silver) / "games")
+
+    # --- Live data (if configured) ---
+    odds_key = os.environ.get("ODDS_API_KEY")
+    sport = SPORT_SLUG.get(league, "americanfootball_nfl")
+
+    # Scores for ratings fit (recent N days)
+    res_csv = Path(season_silver) / "games" / "results.csv"
+    if use_live and odds_key:
+        try:
+            fetch_recent_scores_to_csv(odds_key, sport, res_csv, days_from=scores_days)
+            print(f"[live] results fetched -> {res_csv}")
+        except Exception as e:
+            print(f"[live] results fetch failed: {e}; using sample.")
+            _ensure_sample_results_csv(Path(season_silver))
+    else:
+        _ensure_sample_results_csv(Path(season_silver))
 
     ratings_path = Path(season_silver) / "teams" / "ratings.csv"
     starting_ratings = load_ratings_csv(ratings_path)
     print(f"[ratings] starter: {len(starting_ratings)} from {ratings_path}")
 
     games_dir = Path(season_silver) / "games"
-    _ensure_sample_results_csv(Path(season_silver))
     results = load_results_dir(games_dir)
     print(f"[results] loaded {len(results)} games from {games_dir} (*.csv)")
 
+    # Fit ratings
     model_cfg = cfg.get("model", {})
     method = str(model_cfg.get("ratings_method", "elo")).lower()
 
@@ -150,7 +173,7 @@ def daily(season: int, week: int, league: str, config_path: str, mc_n: int = Non
         sigma_total=float(model_cfg.get("sigma_total", 10.0)),
     )
 
-    # Dynamic league_total_mean from results if available
+    # League totals mean from results
     if results:
         totals = [
             int(g["home_pts"]) + int(g["away_pts"])
@@ -162,7 +185,18 @@ def daily(season: int, week: int, league: str, config_path: str, mc_n: int = Non
         league_total_mean = float(model_cfg.get("league_total_mean", 45.0))
     print(f"[totals] league_total_mean = {league_total_mean:.2f}")
 
-    odds_csv = _ensure_sample_odds_csv(Path(bronze))
+    # Odds
+    odds_csv = Path(bronze) / "odds.csv"
+    if use_live and odds_key:
+        try:
+            fetch_odds_to_csv(odds_key, sport, odds_csv)
+            print(f"[live] odds fetched -> {odds_csv}")
+        except Exception as e:
+            print(f"[live] odds fetch failed: {e}; using sample.")
+            odds_csv = _ensure_sample_odds_csv(Path(bronze))
+    else:
+        odds_csv = _ensure_sample_odds_csv(Path(bronze))
+
     rows = load_odds_csv(odds_csv)
 
     headers = [
@@ -171,91 +205,90 @@ def daily(season: int, week: int, league: str, config_path: str, mc_n: int = Non
     ]
     tickets = []
 
-    if mc_n is not None:
-        # import lazily to avoid numpy dependency where not needed
-        from fbm.modeling.posterior import mc_ci_normal
-
+    # Printing header
     print("\nTickets (filtered):")
-    if mc_n is not None:
-        print("GameID,Market,Side/Bet,Odds(Am),Odds(Dec),Line,FairProb,ModelProb[lo..hi],Edge,EV_per_$,KellyStake")
-    else:
-        print("GameID,Market,Side/Bet,Odds(Am),Odds(Dec),Line,FairProb,ModelProb,Edge,EV_per_$,KellyStake")
+    print("GameID,Market,Side/Bet,Odds(Am),Odds(Dec),Line,FairProb,ModelProb,Edge,EV_per_$,KellyStake")
 
     for r in rows:
         game_id = r["game_id"]; home = r["home_team"]; away = r["away_team"]
 
-        # === ML HOME ===
-        h_ml = int(r["home_ml"]); a_ml = int(r["away_ml"])
-        p_h_imp = implied_prob_from_american(h_ml); p_a_imp = implied_prob_from_american(a_ml)
-        p_h_fair, _ = remove_vig_two_way(p_h_imp, p_a_imp)
-        ml_model = model.win_prob_home(home, away)
-        dec_h = american_to_decimal(h_ml)
-        ev_ml, edge_ml = ev_and_edge(ml_model, p_h_fair, dec_h)
-        stake_ml = kelly_fractional(ml_model, dec_h, bankroll=bankroll, fraction=kelly_frac)
-
-        def _emit_ticket(market, side, am, dec, line, fair, modelp, edge, ev, stake):
-            if passes(edge, stake):
-                if mc_n is not None:
-                    lo, hi = mc_ci_normal(modelp, n=mc_n, seed=mc_seed)
-                    print(f"{game_id},{market},{side},{am:+d},{dec:.4f},{line},{fair:.4f},{modelp:.4f}[{lo:.3f}..{hi:.3f}],{edge:+.4f},{ev:+.4f},${stake:,.2f}")
-                else:
-                    print(f"{game_id},{market},{side},{am:+d},{dec:.4f},{line},{fair:.4f},{modelp:.4f},{edge:+.4f},{ev:+.4f},${stake:,.2f}")
+        def _emit(market, side, am, dec, line, fair, modelp, edge, ev, stake):
+            if (edge >= min_edge) and (stake >= min_stake):
+                print(f"{game_id},{market},{side},{am},{dec:.4f},{line},{fair:.4f},{modelp:.4f},{edge:+.4f},{ev:+.4f},${stake:,.2f}")
                 tickets.append({
                     "game_id": game_id, "market": market, "side_or_bet": side,
-                    "odds_am": f"{am:+d}", "odds_dec": f"{dec:.4f}", "line": f"{line}",
+                    "odds_am": str(am), "odds_dec": f"{dec:.4f}", "line": str(line),
                     "fair_prob": f"{fair:.4f}", "model_prob": f"{modelp:.4f}",
                     "edge": f"{edge:+.4f}", "ev_per_dollar": f"{ev:+.4f}",
                     "kelly_stake": f"{stake:.2f}",
                 })
 
-        _emit_ticket("ML", "HOME", h_ml, dec_h, "", p_h_fair, ml_model, edge_ml, ev_ml, stake_ml)
+        # Moneyline
+        try:
+            h_ml = int(r["home_ml"]); a_ml = int(r["away_ml"])
+        except Exception:
+            h_ml = a_ml = 0  # if missing, skip ML later
+        if h_ml != 0 and a_ml != 0:
+            p_h_imp = implied_prob_from_american(h_ml); p_a_imp = implied_prob_from_american(a_ml)
+            p_h_fair, _ = remove_vig_two_way(p_h_imp, p_a_imp)
+            ml_model = BaselineModel(
+                ratings=fitted, hfa_points=model.hfa_points, sigma_diff=model.sigma_diff, sigma_total=model.sigma_total
+            ).win_prob_home(home, away)
+            dec_h = american_to_decimal(h_ml)
+            ev_ml, edge_ml = ev_and_edge(ml_model, p_h_fair, dec_h)
+            stake_ml = kelly_fractional(ml_model, dec_h, bankroll=bankroll, fraction=kelly_frac)
+            _emit("ML", "HOME", h_ml, dec_h, "", p_h_fair, ml_model, edge_ml, ev_ml, stake_ml)
 
-        # === ATS HOME ===
-        sp_line = float(r["home_spread"])
-        sp_home_price = int(r["home_spread_price"]); sp_away_price = int(r["away_spread_price"])
-        p_sp_h_imp = implied_prob_from_american(sp_home_price); p_sp_a_imp = implied_prob_from_american(sp_away_price)
-        p_sp_h_fair, p_sp_a_fair = remove_vig_two_way(p_sp_h_imp, p_sp_a_imp)
-        mean_diff = fitted.get(home, 0.0) - fitted.get(away, 0.0) + model.hfa_points
-        sp_model_home = prob_cover_spread(mean_diff, model.sigma_diff, sp_line)
-        dec_sp_home = american_to_decimal(sp_home_price)
-        ev_sp_h, edge_sp_h = ev_and_edge(sp_model_home, p_sp_h_fair, dec_sp_home)
-        stake_sp_h = kelly_fractional(sp_model_home, dec_sp_home, bankroll=bankroll, fraction=kelly_frac)
-        _emit_ticket("ATS", "HOME", sp_home_price, dec_sp_home, f"{sp_line:+.1f}", p_sp_h_fair, sp_model_home, edge_sp_h, ev_sp_h, stake_sp_h)
+        # Spreads (home cover)
+        try:
+            sp_line = float(r["home_spread"])
+            sp_home_price = int(r["home_spread_price"]); sp_away_price = int(r["away_spread_price"])
+            p_sp_h_imp = implied_prob_from_american(sp_home_price); p_sp_a_imp = implied_prob_from_american(sp_away_price)
+            p_sp_h_fair, p_sp_a_fair = remove_vig_two_way(p_sp_h_imp, p_sp_a_imp)
+            mean_diff = fitted.get(home, 0.0) - fitted.get(away, 0.0) + model.hfa_points
+            sp_model_home = prob_cover_spread(mean_diff, model.sigma_diff, sp_line)
+            dec_sp_home = american_to_decimal(sp_home_price)
+            ev_sp_h, edge_sp_h = ev_and_edge(sp_model_home, p_sp_h_fair, dec_sp_home)
+            stake_sp_h = kelly_fractional(sp_model_home, dec_sp_home, bankroll=bankroll, fraction=kelly_frac)
+            _emit("ATS", "HOME", sp_home_price, dec_sp_home, f"{sp_line:+.1f}", p_sp_h_fair, sp_model_home, edge_sp_h, ev_sp_h, stake_sp_h)
 
-        # === ATS AWAY (NEW) ===
-        # P(away + X covers) = 1 - P(home covers home_line) when spread is symmetric (prices can differ)
-        sp_model_away = 1.0 - sp_model_home
-        dec_sp_away = american_to_decimal(sp_away_price)
-        ev_sp_a, edge_sp_a = ev_and_edge(sp_model_away, p_sp_a_fair, dec_sp_away)
-        stake_sp_a = kelly_fractional(sp_model_away, dec_sp_away, bankroll=bankroll, fraction=kelly_frac)
-        _emit_ticket("ATS", "AWAY", sp_away_price, dec_sp_away, f"{-sp_line:+.1f}", p_sp_a_fair, sp_model_away, edge_sp_a, ev_sp_a, stake_sp_a)
+            # away cover = 1 - home cover, line sign flips for display
+            sp_model_away = 1.0 - sp_model_home
+            dec_sp_away = american_to_decimal(sp_away_price)
+            ev_sp_a, edge_sp_a = ev_and_edge(sp_model_away, p_sp_a_fair, dec_sp_away)
+            stake_sp_a = kelly_fractional(sp_model_away, dec_sp_away, bankroll=bankroll, fraction=kelly_frac)
+            _emit("ATS", "AWAY", sp_away_price, dec_sp_away, f"{-sp_line:+.1f}", p_sp_a_fair, sp_model_away, edge_sp_a, ev_sp_a, stake_sp_a)
+        except Exception:
+            pass
 
-        # === OU OVER ===
-        tot_line = float(r["total_line"])
-        over_price = int(r["over_price"]); under_price = int(r["under_price"])
-        p_over_imp = implied_prob_from_american(over_price); p_under_imp = implied_prob_from_american(under_price)
-        p_over_fair, p_under_fair = remove_vig_two_way(p_over_imp, p_under_imp)
-        tot_model_over = prob_total_over(league_total_mean, model.sigma_total, tot_line)
-        dec_over = american_to_decimal(over_price)
-        ev_ou_o, edge_ou_o = ev_and_edge(tot_model_over, p_over_fair, dec_over)
-        stake_ou_o = kelly_fractional(tot_model_over, dec_over, bankroll=bankroll, fraction=kelly_frac)
-        _emit_ticket("OU", "OVER", over_price, dec_over, f"{tot_line:.1f}", p_over_fair, tot_model_over, edge_ou_o, ev_ou_o, stake_ou_o)
+        # Totals
+        try:
+            tot_line = float(r["total_line"])
+            over_price = int(r["over_price"]); under_price = int(r["under_price"])
+            p_over_imp = implied_prob_from_american(over_price); p_under_imp = implied_prob_from_american(under_price)
+            p_over_fair, p_under_fair = remove_vig_two_way(p_over_imp, p_under_imp)
+            tot_model_over = prob_total_over(league_total_mean, model.sigma_total, tot_line)
+            dec_over = american_to_decimal(over_price)
+            ev_ou_o, edge_ou_o = ev_and_edge(tot_model_over, p_over_fair, dec_over)
+            stake_ou_o = kelly_fractional(tot_model_over, dec_over, bankroll=bankroll, fraction=kelly_frac)
+            _emit("OU", "OVER", over_price, dec_over, f"{tot_line:.1f}", p_over_fair, tot_model_over, edge_ou_o, ev_ou_o, stake_ou_o)
 
-        # === OU UNDER (NEW) ===
-        tot_model_under = 1.0 - tot_model_over
-        dec_under = american_to_decimal(under_price)
-        ev_ou_u, edge_ou_u = ev_and_edge(tot_model_under, p_under_fair, dec_under)
-        stake_ou_u = kelly_fractional(tot_model_under, dec_under, bankroll=bankroll, fraction=kelly_frac)
-        _emit_ticket("OU", "UNDER", under_price, dec_under, f"{tot_line:.1f}", p_under_fair, tot_model_under, edge_ou_u, ev_ou_u, stake_ou_u)
+            tot_model_under = 1.0 - tot_model_over
+            dec_under = american_to_decimal(under_price)
+            ev_ou_u, edge_ou_u = ev_and_edge(tot_model_under, p_under_fair, dec_under)
+            stake_ou_u = kelly_fractional(tot_model_under, dec_under, bankroll=bankroll, fraction=kelly_frac)
+            _emit("OU", "UNDER", under_price, dec_under, f"{tot_line:.1f}", p_under_fair, tot_model_under, edge_ou_u, ev_ou_u, stake_ou_u)
+        except Exception:
+            pass
 
     out_csv = Path(gold) / "tickets.csv"
     write_csv(out_csv, tickets, headers)
     print(f"\nSaved {len(tickets)} tickets to {out_csv}")
 
-    # Optional IFTTT notification
+    # Optional IFTTT notification (unchanged)
     if notify_ifttt and tickets:
         try:
-            import os, json, urllib.request
+            import json, urllib.request
             key = os.environ.get("IFTTT_KEY")
             event = os.environ.get("IFTTT_EVENT", "fbm_picks")
             if not key:
@@ -275,15 +308,12 @@ def daily(season: int, week: int, league: str, config_path: str, mc_n: int = Non
         except Exception as e:
             print(f"[notify] IFTTT error: {e}")
 
-    print("\nPipeline (stub):")
-    print(" - ingest odds/schedules -> bronze")
-    print(" - normalize -> silver")
-    print(" - fit ratings from results -> season_silver/teams/ratings_fitted_{method}.csv")
-    print(" - build features -> gold")
-    print(" - sample posterior -> probabilities")
-    print(" - compare vs market -> edges + kelly")
+    print("\nPipeline (live if configured):")
+    print(" - fetch results (live or sample) -> season_silver/games/results.csv")
+    print(" - fit ratings -> season_silver/teams/ratings_fitted_{method}.csv")
+    print(" - fetch odds (live or sample) -> bronze/week/odds.csv")
+    print(" - compute edges + kelly -> gold/week/tickets.csv")
     print("Done.")
-
 
 def main():
     parser = argparse.ArgumentParser(prog="fbm", description="Football Bayesian Model CLI")
@@ -294,21 +324,21 @@ def main():
     p_daily.add_argument("--week", type=int, required=True, help="Week number")
     p_daily.add_argument("--league", choices=["NFL", "CFB"], default="NFL", help="League (NFL default)")
     p_daily.add_argument("--config", default="conf/default.yaml", help="Path to YAML config")
-    # Optional Monte Carlo controls for CI/notifications
     p_daily.add_argument("--mc-n", type=int, default=None)
     p_daily.add_argument("--mc-seed", type=int, default=None)
-    # Optional notification flags
     p_daily.add_argument("--notify-ifttt", action="store_true")
     p_daily.add_argument("--notify-top-n", type=int, default=3)
+    p_daily.add_argument("--no-live", action="store_true", help="Disable live fetch even if ODDS_API_KEY is set")
+    p_daily.add_argument("--scores-days", type=int, default=14, help="How many days back to pull scores")
 
     args = parser.parse_args()
     if args.cmd == "daily":
         daily(
-            season=args.season, week=args.week, league=args. league,
-            config_path=args.config, mc_n=args.mc_n, mc_seed=args.mc_seed,
-            notify_ifttt=args.notify_ifttt, notify_top_n=args.notify_top_n
+            season=args.season, week=args.week, league=args.league, config_path=args.config,
+            mc_n=args.mc_n, mc_seed=args.mc_seed,
+            notify_ifttt=args.notify_ifttt, notify_top_n=args.notify_top_n,
+            use_live=(not args.no_live), scores_days=args.scores_days
         )
-
 
 if __name__ == "__main__":
     main()
