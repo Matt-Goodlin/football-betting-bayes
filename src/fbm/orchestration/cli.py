@@ -1,6 +1,7 @@
 import argparse
 import os
 from pathlib import Path
+from datetime import datetime
 
 from fbm.utils.partitions import part_path
 from fbm.utils.io import ensure_dir
@@ -23,7 +24,7 @@ from fbm.modeling.ratings_fit import fit_elo_ratings, normalize_ratings
 from fbm.modeling.bayes_ratings import fit_bayes_ratings
 from fbm.modeling.posterior import prob_cover_spread, prob_total_over
 from fbm.utils.csvout import write_csv
-
+from fbm.utils.history import append_csv
 
 SPORT_SLUG = {
     "NFL": "americanfootball_nfl",
@@ -63,6 +64,34 @@ def _write_ratings_csv(path: Path, ratings: dict) -> None:
     ensure_dir(path.parent)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+def _summarize_tickets(tickets):
+    """Return (summary_text, total_stake, total_exp_ev) and a markdown table string."""
+    total_stake = 0.0
+    total_exp_ev = 0.0
+    lines = []
+    for t in tickets:
+        stake = float(t["_stake_num"])
+        ev    = float(t["_ev_num"])
+        total_stake += stake
+        total_exp_ev += ev
+        # Compact one-liner
+        lines.append(f"{t['game_id']} {t['market']} {t['side_or_bet']} {t['odds_am']} | edge {t['edge']} | stake ${stake:,.0f}")
+    summary = "\n".join(lines)
+
+    # Markdown table (nice to view on GitHub)
+    md = [
+        "| Game | Market | Side | American | Decimal | Line | Fair | Model | Edge | EV/$ | Stake |",
+        "|-----:|:------:|:----:|---------:|--------:|-----:|-----:|------:|-----:|-----:|------:|",
+    ]
+    for t in tickets:
+        md.append(
+            f"| {t['game_id']} | {t['market']} | {t['side_or_bet']} | {t['odds_am']} | {t['odds_dec']} | "
+            f"{t['line']} | {t['fair_prob']} | {t['model_prob']} | {t['edge']} | {t['ev_per_dollar']} | ${float(t['_stake_num']):,.2f} |"
+        )
+    md.append("")
+    md.append(f"**Total stake**: ${total_stake:,.2f}   |   **Expected profit**: ${total_exp_ev:,.2f}")
+    return summary, total_stake, total_exp_ev, "\n".join(md)
+
 def daily(season: int, week: int, league: str, config_path: str,
           mc_n: int = None, mc_seed: int = None,
           notify_ifttt: bool = False, notify_top_n: int = 3,
@@ -98,7 +127,6 @@ def daily(season: int, week: int, league: str, config_path: str,
     ensure_dir(Path(season_silver) / "teams")
     ensure_dir(Path(season_silver) / "games")
 
-    # --- Live data (if configured) ---
     odds_key = os.environ.get("ODDS_API_KEY")
     sport = SPORT_SLUG.get(league, "americanfootball_nfl")
 
@@ -203,6 +231,8 @@ def daily(season: int, week: int, league: str, config_path: str,
         "game_id","market","side_or_bet","odds_am","odds_dec",
         "line","fair_prob","model_prob","edge","ev_per_dollar","kelly_stake",
     ]
+    # season history gets extra context:
+    season_headers = headers + ["league","season","week","run_ts"]
     tickets = []
 
     # Printing header
@@ -212,7 +242,7 @@ def daily(season: int, week: int, league: str, config_path: str,
     for r in rows:
         game_id = r["game_id"]; home = r["home_team"]; away = r["away_team"]
 
-        def _emit(market, side, am, dec, line, fair, modelp, edge, ev, stake):
+        def _push(market, side, am, dec, line, fair, modelp, edge, ev, stake):
             if (edge >= min_edge) and (stake >= min_stake):
                 print(f"{game_id},{market},{side},{am},{dec:.4f},{line},{fair:.4f},{modelp:.4f},{edge:+.4f},{ev:+.4f},${stake:,.2f}")
                 tickets.append({
@@ -221,25 +251,26 @@ def daily(season: int, week: int, league: str, config_path: str,
                     "fair_prob": f"{fair:.4f}", "model_prob": f"{modelp:.4f}",
                     "edge": f"{edge:+.4f}", "ev_per_dollar": f"{ev:+.4f}",
                     "kelly_stake": f"{stake:.2f}",
+                    # numeric for summary math
+                    "_stake_num": f"{stake:.2f}",
+                    "_ev_num": f"{ev*stake:.2f}",
                 })
 
-        # Moneyline
+        # Moneyline HOME
         try:
             h_ml = int(r["home_ml"]); a_ml = int(r["away_ml"])
         except Exception:
-            h_ml = a_ml = 0  # if missing, skip ML later
+            h_ml = a_ml = 0
         if h_ml != 0 and a_ml != 0:
             p_h_imp = implied_prob_from_american(h_ml); p_a_imp = implied_prob_from_american(a_ml)
             p_h_fair, _ = remove_vig_two_way(p_h_imp, p_a_imp)
-            ml_model = BaselineModel(
-                ratings=fitted, hfa_points=model.hfa_points, sigma_diff=model.sigma_diff, sigma_total=model.sigma_total
-            ).win_prob_home(home, away)
+            ml_model = model.win_prob_home(home, away)
             dec_h = american_to_decimal(h_ml)
             ev_ml, edge_ml = ev_and_edge(ml_model, p_h_fair, dec_h)
             stake_ml = kelly_fractional(ml_model, dec_h, bankroll=bankroll, fraction=kelly_frac)
-            _emit("ML", "HOME", h_ml, dec_h, "", p_h_fair, ml_model, edge_ml, ev_ml, stake_ml)
+            _push("ML", "HOME", h_ml, dec_h, "", p_h_fair, ml_model, edge_ml, ev_ml, stake_ml)
 
-        # Spreads (home cover)
+        # ATS HOME + AWAY
         try:
             sp_line = float(r["home_spread"])
             sp_home_price = int(r["home_spread_price"]); sp_away_price = int(r["away_spread_price"])
@@ -250,18 +281,17 @@ def daily(season: int, week: int, league: str, config_path: str,
             dec_sp_home = american_to_decimal(sp_home_price)
             ev_sp_h, edge_sp_h = ev_and_edge(sp_model_home, p_sp_h_fair, dec_sp_home)
             stake_sp_h = kelly_fractional(sp_model_home, dec_sp_home, bankroll=bankroll, fraction=kelly_frac)
-            _emit("ATS", "HOME", sp_home_price, dec_sp_home, f"{sp_line:+.1f}", p_sp_h_fair, sp_model_home, edge_sp_h, ev_sp_h, stake_sp_h)
+            _push("ATS", "HOME", sp_home_price, dec_sp_home, f"{sp_line:+.1f}", p_sp_h_fair, sp_model_home, edge_sp_h, ev_sp_h, stake_sp_h)
 
-            # away cover = 1 - home cover, line sign flips for display
             sp_model_away = 1.0 - sp_model_home
             dec_sp_away = american_to_decimal(sp_away_price)
             ev_sp_a, edge_sp_a = ev_and_edge(sp_model_away, p_sp_a_fair, dec_sp_away)
             stake_sp_a = kelly_fractional(sp_model_away, dec_sp_away, bankroll=bankroll, fraction=kelly_frac)
-            _emit("ATS", "AWAY", sp_away_price, dec_sp_away, f"{-sp_line:+.1f}", p_sp_a_fair, sp_model_away, edge_sp_a, ev_sp_a, stake_sp_a)
+            _push("ATS", "AWAY", sp_away_price, dec_sp_away, f"{-sp_line:+.1f}", p_sp_a_fair, sp_model_away, edge_sp_a, ev_sp_a, stake_sp_a)
         except Exception:
             pass
 
-        # Totals
+        # Totals OVER + UNDER
         try:
             tot_line = float(r["total_line"])
             over_price = int(r["over_price"]); under_price = int(r["under_price"])
@@ -271,21 +301,45 @@ def daily(season: int, week: int, league: str, config_path: str,
             dec_over = american_to_decimal(over_price)
             ev_ou_o, edge_ou_o = ev_and_edge(tot_model_over, p_over_fair, dec_over)
             stake_ou_o = kelly_fractional(tot_model_over, dec_over, bankroll=bankroll, fraction=kelly_frac)
-            _emit("OU", "OVER", over_price, dec_over, f"{tot_line:.1f}", p_over_fair, tot_model_over, edge_ou_o, ev_ou_o, stake_ou_o)
+            _push("OU", "OVER", over_price, dec_over, f"{tot_line:.1f}", p_over_fair, tot_model_over, edge_ou_o, ev_ou_o, stake_ou_o)
 
             tot_model_under = 1.0 - tot_model_over
             dec_under = american_to_decimal(under_price)
             ev_ou_u, edge_ou_u = ev_and_edge(tot_model_under, p_under_fair, dec_under)
             stake_ou_u = kelly_fractional(tot_model_under, dec_under, bankroll=bankroll, fraction=kelly_frac)
-            _emit("OU", "UNDER", under_price, dec_under, f"{tot_line:.1f}", p_under_fair, tot_model_under, edge_ou_u, ev_ou_u, stake_ou_u)
+            _push("OU", "UNDER", under_price, dec_under, f"{tot_line:.1f}", p_under_fair, tot_model_under, edge_ou_u, ev_ou_u, stake_ou_u)
         except Exception:
             pass
 
+    # Save weekly tickets CSV
     out_csv = Path(gold) / "tickets.csv"
     write_csv(out_csv, tickets, headers)
     print(f"\nSaved {len(tickets)} tickets to {out_csv}")
 
-    # Optional IFTTT notification (unchanged)
+    # Append season history (gold/season_history.csv)
+    run_ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    season_history_path = Path(part_path(cfg["paths"]["datalake"], "gold", league, season, None)) / "season_history.csv"
+    season_rows = []
+    for t in tickets:
+        row = {k: t.get(k, "") for k in headers}
+        row.update({"league": league, "season": season, "week": week, "run_ts": run_ts})
+        season_rows.append(row)
+    append_csv(season_history_path, season_rows, season_headers)
+    print(f"[history] appended {len(season_rows)} rows -> {season_history_path}")
+
+    # Write a markdown summary for quick viewing in GitHub
+    summary_txt, total_stake, total_exp_ev, md_table = _summarize_tickets(tickets)
+    md_path = Path(gold) / "summary.md"
+    md_path.write_text(
+        f"# {league} {season} Week {week} — Model Picks\n\n"
+        f"**Total stake:** ${total_stake:,.2f}  \n"
+        f"**Expected profit:** ${total_exp_ev:,.2f}\n\n"
+        f"{md_table}\n",
+        encoding="utf-8"
+    )
+    print(f"[summary] wrote {md_path}")
+
+    # Optional IFTTT notification (cleaner text)
     if notify_ifttt and tickets:
         try:
             import json, urllib.request
@@ -295,11 +349,13 @@ def daily(season: int, week: int, league: str, config_path: str,
                 print("[notify] Skipping IFTTT: missing IFTTT_KEY (arg or env).")
             else:
                 top_n = max(1, int(notify_top_n))
+                # compact top-N lines
+                lines = []
+                for t in tickets[:top_n]:
+                    lines.append(f"{t['market']} {t['side_or_bet']} {t['odds_am']} | edge {t['edge']} | stake ${float(t['_stake_num']):,.0f}")
+                lines.append(f"— Total stake: ${total_stake:,.0f} | Exp. profit: ${total_exp_ev:,.0f}")
                 msg_title = f"{league} {season} W{week}: Top {min(top_n, len(tickets))} tickets"
-                msg_body = "\n".join(
-                    f"{t['market']} {t['side_or_bet']} {t['odds_am']} | edge {t['edge']} | stake ${t['kelly_stake']}"
-                    for t in tickets[:top_n]
-                )
+                msg_body = "\n".join(lines)
                 payload = {"value1": msg_title, "value2": msg_body}
                 url = f"https://maker.ifttt.com/trigger/{event}/with/key/{key}"
                 req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
@@ -312,7 +368,7 @@ def daily(season: int, week: int, league: str, config_path: str,
     print(" - fetch results (live or sample) -> season_silver/games/results.csv")
     print(" - fit ratings -> season_silver/teams/ratings_fitted_{method}.csv")
     print(" - fetch odds (live or sample) -> bronze/week/odds.csv")
-    print(" - compute edges + kelly -> gold/week/tickets.csv")
+    print(" - compute edges + kelly -> gold/week/tickets.csv + gold/summary.md + season_history.csv")
     print("Done.")
 
 def main():
