@@ -1,5 +1,7 @@
 import argparse
+import os
 from pathlib import Path
+from typing import Optional
 
 from fbm.utils.partitions import part_path
 from fbm.utils.io import ensure_dir
@@ -20,11 +22,11 @@ from fbm.modeling.ratings_csv import load_ratings_csv
 from fbm.modeling.ratings_fit import fit_elo_ratings, normalize_ratings
 from fbm.modeling.bayes_ratings import fit_bayes_ratings
 from fbm.modeling.posterior import (
-    prob_cover_spread,
-    prob_total_over,
     simulate_cover_spread,
     simulate_total_over,
+    mc_ci_normal,
 )
+from fbm.notify.ifttt import build_title_and_message, post_ifttt
 from fbm.utils.csvout import write_csv
 
 
@@ -64,14 +66,24 @@ def _write_ratings_csv(path: Path, ratings: dict) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def daily(season: int, week: int, league: str, config_path: str, mc_n: int, mc_seed: int | None):
+def daily(
+    season: int,
+    week: int,
+    league: str,
+    config_path: str,
+    mc_n: Optional[int],
+    mc_seed: Optional[int],
+    notify_ifttt: bool = False,
+    ifttt_key: Optional[str] = None,
+    ifttt_event: Optional[str] = None,
+    notify_top_n: int = 3,
+):
     cfg = load_config(config_path)
     bankroll = float(cfg["betting"]["bankroll"])
     kelly_frac = float(cfg["betting"]["kelly_fraction"])
     min_edge = float(cfg["betting"].get("min_edge_pct", 0.0))
     min_stake = float(cfg["betting"].get("min_kelly_stake", 0.0))
 
-    # Allow config defaults if CLI not provided
     if mc_n is None:
         mc_n = int(cfg.get("model", {}).get("mc_n", 10000))
     if mc_seed is None:
@@ -162,20 +174,16 @@ def daily(season: int, week: int, league: str, config_path: str, mc_n: int, mc_s
         sigma_total=float(model_cfg.get("sigma_total", 10.0)),
     )
 
-    # Dynamically compute league_total_mean from results
+    # League total mean from results, fallback to config default
     if results:
         totals = [
             int(g["home_pts"]) + int(g["away_pts"])
             for g in results
             if g.get("home_pts") and g.get("away_pts")
         ]
-        if totals:
-            league_total_mean = sum(totals) / len(totals)
-        else:
-            league_total_mean = float(model_cfg.get("league_total_mean", 45.0))
+        league_total_mean = sum(totals) / len(totals) if totals else float(model_cfg.get("league_total_mean", 45.0))
     else:
         league_total_mean = float(model_cfg.get("league_total_mean", 45.0))
-
     print(f"[totals] league_total_mean = {league_total_mean:.2f}")
 
     odds_csv = _ensure_sample_odds_csv(Path(bronze))
@@ -183,17 +191,18 @@ def daily(season: int, week: int, league: str, config_path: str, mc_n: int, mc_s
 
     headers = [
         "game_id","market","side_or_bet","odds_am","odds_dec",
-        "line","fair_prob","model_prob","edge","ev_per_dollar","kelly_stake",
+        "line","fair_prob","model_prob","model_prob_lo","model_prob_hi",
+        "edge","ev_per_dollar","kelly_stake",
     ]
     tickets = []
 
     print("\nTickets (filtered):")
-    print("GameID,Market,Side/Bet,Odds(Am),Odds(Dec),Line,FairProb,ModelProb,Edge,EV_per_$,KellyStake")
+    print("GameID,Market,Side/Bet,Odds(Am),Odds(Dec),Line,FairProb,ModelProb[lo..hi],Edge,EV_per_$,KellyStake")
 
     for r in rows:
         game_id = r["game_id"]; home = r["home_team"]; away = r["away_team"]
 
-        # ML HOME
+        # ML HOME (closed-form win prob; CI displayed using mc_ci_normal for readability)
         h_ml = int(r["home_ml"]); a_ml = int(r["away_ml"])
         p_h_imp = implied_prob_from_american(h_ml); p_a_imp = implied_prob_from_american(a_ml)
         p_h_fair, _ = remove_vig_two_way(p_h_imp, p_a_imp)
@@ -202,55 +211,71 @@ def daily(season: int, week: int, league: str, config_path: str, mc_n: int, mc_s
         ev_ml, edge_ml = ev_and_edge(ml_model, p_h_fair, dec_h)
         stake_ml = kelly_fractional(ml_model, dec_h, bankroll=bankroll, fraction=kelly_frac)
         if passes(edge_ml, stake_ml):
-            print(f"{game_id},ML,HOME,{h_ml:+d},{dec_h:.4f},,{p_h_fair:.4f},{ml_model:.4f},{edge_ml:+.4f},{ev_ml:+.4f},${stake_ml:,.2f}")
+            lo_ml, hi_ml = mc_ci_normal(ml_model, n=int(mc_n))  # display-only CI
+            print(f"{game_id},ML,HOME,{h_ml:+d},{dec_h:.4f},,{p_h_fair:.4f},{ml_model:.4f}[{lo_ml:.3f}..{hi_ml:.3f}],{edge_ml:+.4f},{ev_ml:+.4f},${stake_ml:,.2f}")
             tickets.append({
                 "game_id": game_id, "market": "ML", "side_or_bet": "HOME",
                 "odds_am": f"{h_ml:+d}", "odds_dec": f"{dec_h:.4f}", "line": "",
                 "fair_prob": f"{p_h_fair:.4f}", "model_prob": f"{ml_model:.4f}",
-                "edge": f"{edge_ml:+.4f}", "ev_per_dollar": f"{ev_ml:+.4f}",
-                "kelly_stake": f"{stake_ml:.2f}",
+                "model_prob_lo": f"{lo_ml:.4f}", "model_prob_hi": f"{hi_ml:.4f}",
+                "edge": f"{edge_ml:+.4f}", "ev_per_dollar": f"{ev_ml:+.4f}", "kelly_stake": f"{stake_ml:.2f}",
             })
 
-        # ATS HOME — Monte Carlo posterior
+        # ATS HOME — Monte Carlo posterior + CI
         sp_line = float(r["home_spread"])
         sp_home_price = int(r["home_spread_price"]); sp_away_price = int(r["away_spread_price"])
         p_sp_h_imp = implied_prob_from_american(sp_home_price); p_sp_a_imp = implied_prob_from_american(sp_away_price)
         p_sp_h_fair, _ = remove_vig_two_way(p_sp_h_imp, p_sp_a_imp)
         mean_diff = fitted.get(home, 0.0) - fitted.get(away, 0.0) + model.hfa_points
-        sp_model = simulate_cover_spread(mean_diff, model.sigma_diff, sp_line, n=mc_n, seed=mc_seed)
+        sp_model = simulate_cover_spread(mean_diff, model.sigma_diff, sp_line, n=int(mc_n), seed=mc_seed)
+        lo_sp, hi_sp = mc_ci_normal(sp_model, n=int(mc_n))
         dec_sp_home = american_to_decimal(sp_home_price)
         ev_sp, edge_sp = ev_and_edge(sp_model, p_sp_h_fair, dec_sp_home)
         stake_sp = kelly_fractional(sp_model, dec_sp_home, bankroll=bankroll, fraction=kelly_frac)
         if passes(edge_sp, stake_sp):
-            print(f"{game_id},ATS,HOME,{sp_home_price:+d},{dec_sp_home:.4f},{sp_line:+.1f},{p_sp_h_fair:.4f},{sp_model:.4f},{edge_sp:+.4f},{ev_sp:+.4f},${stake_sp:,.2f}")
+            print(f"{game_id},ATS,HOME,{sp_home_price:+d},{dec_sp_home:.4f},{sp_line:+.1f},{p_sp_h_fair:.4f},{sp_model:.4f}[{lo_sp:.3f}..{hi_sp:.3f}],{edge_sp:+.4f},{ev_sp:+.4f},${stake_sp:,.2f}")
             tickets.append({
                 "game_id": game_id, "market": "ATS", "side_or_bet": "HOME",
                 "odds_am": f"{sp_home_price:+d}", "odds_dec": f"{dec_sp_home:.4f}", "line": f"{sp_line:+.1f}",
                 "fair_prob": f"{p_sp_h_fair:.4f}", "model_prob": f"{sp_model:.4f}",
+                "model_prob_lo": f"{lo_sp:.4f}", "model_prob_hi": f"{hi_sp:.4f}",
                 "edge": f"{edge_sp:+.4f}", "ev_per_dollar": f"{ev_sp:+.4f}", "kelly_stake": f"{stake_sp:.2f}",
             })
 
-        # OU OVER — Monte Carlo posterior
+        # OU OVER — Monte Carlo posterior + CI
         tot_line = float(r["total_line"])
         over_price = int(r["over_price"]); under_price = int(r["under_price"])
         p_over_imp = implied_prob_from_american(over_price); p_under_imp = implied_prob_from_american(under_price)
         p_over_fair, _ = remove_vig_two_way(p_over_imp, p_under_imp)
-        tot_model = simulate_total_over(league_total_mean, model.sigma_total, tot_line, n=mc_n, seed=mc_seed)
+        tot_model = simulate_total_over(league_total_mean, model.sigma_total, tot_line, n=int(mc_n), seed=mc_seed)
+        lo_ou, hi_ou = mc_ci_normal(tot_model, n=int(mc_n))
         dec_over = american_to_decimal(over_price)
         ev_ou, edge_ou = ev_and_edge(tot_model, p_over_fair, dec_over)
         stake_ou = kelly_fractional(tot_model, dec_over, bankroll=bankroll, fraction=kelly_frac)
         if passes(edge_ou, stake_ou):
-            print(f"{game_id},OU,OVER,{over_price:+d},{dec_over:.4f},{tot_line:.1f},{p_over_fair:.4f},{tot_model:.4f},{edge_ou:+.4f},{ev_ou:+.4f},${stake_ou:.2f}")
+            print(f"{game_id},OU,OVER,{over_price:+d},{dec_over:.4f},{tot_line:.1f},{p_over_fair:.4f},{tot_model:.4f}[{lo_ou:.3f}..{hi_ou:.3f}],{edge_ou:+.4f},{ev_ou:+.4f},${stake_ou:,.2f}")
             tickets.append({
                 "game_id": game_id, "market": "OU", "side_or_bet": "OVER",
                 "odds_am": f"{over_price:+d}", "odds_dec": f"{dec_over:.4f}", "line": f"{tot_line:.1f}",
                 "fair_prob": f"{p_over_fair:.4f}", "model_prob": f"{tot_model:.4f}",
+                "model_prob_lo": f"{lo_ou:.4f}", "model_prob_hi": f"{hi_ou:.4f}",
                 "edge": f"{edge_ou:+.4f}", "ev_per_dollar": f"{ev_ou:+.4f}", "kelly_stake": f"{stake_ou:.2f}",
             })
 
     out_csv = Path(gold) / "tickets.csv"
     write_csv(out_csv, tickets, headers)
     print(f"\nSaved {len(tickets)} tickets to {out_csv}")
+
+    # -------- Optional iPhone push via IFTTT Webhooks --------
+    if notify_ifttt:
+        key = ifttt_key or os.environ.get("IFTTT_KEY")
+        event = ifttt_event or os.environ.get("IFTTT_EVENT", "fbm_picks")
+        if not key:
+            print("[notify] Skipping IFTTT: missing IFTTT_KEY (arg or env).")
+        else:
+            title, msg = build_title_and_message(tickets, league, season, week, top_n=notify_top_n)
+            ok, info = post_ifttt(key, event, title, msg)
+            print(f"[notify] IFTTT: {info}")
 
     print("\nPipeline (stub):")
     print(" - ingest odds/schedules -> bronze")
@@ -273,6 +298,11 @@ def main():
     p_daily.add_argument("--config", default="conf/default.yaml", help="Path to YAML config")
     p_daily.add_argument("--mc-n", type=int, default=None, help="Monte Carlo draws per market (overrides config)")
     p_daily.add_argument("--mc-seed", type=int, default=None, help="RNG seed for Monte Carlo (overrides config)")
+    # IFTTT notification flags
+    p_daily.add_argument("--notify-ifttt", action="store_true", help="Send iPhone push via IFTTT Webhooks")
+    p_daily.add_argument("--ifttt-key", type=str, default=None, help="IFTTT Webhooks key (or env IFTTT_KEY)")
+    p_daily.add_argument("--ifttt-event", type=str, default="fbm_picks", help="IFTTT event name (default fbm_picks)")
+    p_daily.add_argument("--notify-top-n", type=int, default=3, help="How many top tickets to include")
 
     args = parser.parse_args()
     if args.cmd == "daily":
@@ -283,6 +313,10 @@ def main():
             config_path=args.config,
             mc_n=args.mc_n,
             mc_seed=args.mc_seed,
+            notify_ifttt=args.notify_ifttt,
+            ifttt_key=args.ifttt_key,
+            ifttt_event=args.ifttt_event,
+            notify_top_n=args.notify_top_n,
         )
 
 

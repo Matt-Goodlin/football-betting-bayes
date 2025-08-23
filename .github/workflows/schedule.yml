@@ -1,0 +1,37 @@
+name: Scheduled Picks
+
+on:
+  schedule:
+    # UTC times; adjust as you like (13:00 UTC ≈ 9am ET during EDT)
+    - cron: "0 13 * * *"        # Daily 9am ET
+    - cron: "0 14 * * 4"        # Thu 10am ET (TNF morning)
+    - cron: "0 14 * * 7"        # Sun 10am ET (gameday morning)
+  workflow_dispatch: {}
+
+jobs:
+  run-picks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip wheel
+          pip install -r requirements-dev.txt
+
+      - name: Run pipeline + notify
+        env:
+          PYTHONPATH: src
+          IFTTT_KEY: ${{ secrets.IFTTT_KEY }}
+          IFTTT_EVENT: ${{ secrets.IFTTT_EVENT }}
+        run: |
+          python -m fbm.orchestration.cli daily \
+            --league NFL --season 2025 --week 2 \
+            --mc-n 20000 --mc-seed 42 \
+            --notify-ifttt --notify-top-n 3
