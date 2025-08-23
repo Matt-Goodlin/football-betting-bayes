@@ -35,3 +35,5 @@ jobs:
             --league NFL --season 2025 --week 2 \
             --mc-n 20000 --mc-seed 42 \
             --notify-ifttt --notify-top-n 3
+
+# touch to register in Actions UI
