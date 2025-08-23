@@ -1,5 +1,5 @@
 paths:
-  datalake: "./data"
+  datalake: data
 
 betting:
   bankroll: 10000
@@ -8,7 +8,23 @@ betting:
   min_kelly_stake: 25
 
 model:
+  ratings_method: bayes     # bayes | elo
+
+  # Baseline model parameters
   hfa_points: 2.0
   sigma_diff: 13.0
   sigma_total: 10.0
   league_total_mean: 45.0
+
+  # Elo fitter parameters
+  elo_k: 20.0
+  elo_iters: 2
+  ratings_target_std: 3.0
+
+  # Margin-of-victory controls (Elo)
+  mov_enabled: true
+  mov_scale_pts: 7.0
+  mov_cap: 2.0
+
+  # Bayesian (ridge/MAP) knobs
+  bayes_l2_lambda: 4.0

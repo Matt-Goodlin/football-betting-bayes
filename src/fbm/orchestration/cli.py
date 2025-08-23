@@ -17,7 +17,8 @@ from fbm.markets.kelly import kelly_fractional
 from fbm.markets.edge import ev_and_edge
 from fbm.modeling.baseline import BaselineModel
 from fbm.modeling.ratings_csv import load_ratings_csv
-from fbm.modeling.ratings_fit import fit_elo_ratings
+from fbm.modeling.ratings_fit import fit_elo_ratings, normalize_ratings
+from fbm.modeling.bayes_ratings import fit_bayes_ratings
 from fbm.utils.csvout import write_csv
 
 
@@ -51,7 +52,6 @@ def _ensure_sample_results_csv(season_silver_path: Path) -> Path:
 
 def _write_ratings_csv(path: Path, ratings: dict) -> None:
     lines = ["team,rating"]
-    # stable order for diffs
     for team in sorted(ratings.keys()):
         lines.append(f"{team},{ratings[team]:.6f}")
     ensure_dir(path.parent)
@@ -84,39 +84,62 @@ def daily(season: int, week: int, league: str, config_path: str):
     print(f" - gold   → {gold}")
     ensure_dir(bronze); ensure_dir(silver); ensure_dir(gold)
 
-    # Season-level silver
     season_silver = part_path(dataroot, "silver", league, season, None)
     ensure_dir(Path(season_silver) / "teams")
 
-    # Load starter ratings (optional static)
     ratings_path = Path(season_silver) / "teams" / "ratings.csv"
     starting_ratings = load_ratings_csv(ratings_path)
     print(f"[ratings] starter: {len(starting_ratings)} from {ratings_path}")
 
-    # Load results and fit Elo ratings
     results_path = _ensure_sample_results_csv(Path(season_silver))
     results = load_results_csv(results_path)
     print(f"[results] loaded {len(results)} games from {results_path}")
 
-    hfa_cfg = float(cfg.get("model", {}).get("hfa_points", 2.0))
-    scale_pts = float(cfg.get("model", {}).get("sigma_diff", 13.0))  # reuse sigma as scale
-    elo_k = float(cfg.get("model", {}).get("elo_k", 20.0))
-    elo_iters = int(cfg.get("model", {}).get("elo_iters", 2))
-
-    fitted = fit_elo_ratings(
-        results,
-        start_ratings=starting_ratings,
-        k=elo_k,
-        hfa_points=hfa_cfg,
-        iters=elo_iters,
-        scale_pts=scale_pts,
-    )
-    fitted_path = Path(season_silver) / "teams" / "ratings_fitted.csv"
-    _write_ratings_csv(fitted_path, fitted)
-    print(f"[ratings] fitted: {len(fitted)} saved to {fitted_path}")
-
-    # Use fitted ratings in the baseline model
     model_cfg = cfg.get("model", {})
+    method = str(model_cfg.get("ratings_method", "elo")).lower()
+
+    if method == "bayes":
+        l2_lambda = float(model_cfg.get("bayes_l2_lambda", 4.0))
+        hfa_cfg = float(model_cfg.get("hfa_points", 2.0))
+        fitted, _ = fit_bayes_ratings(
+            results,
+            hfa_points=hfa_cfg,
+            l2_lambda=l2_lambda,
+            start_ratings=starting_ratings or None,
+            enforce_sum_zero=True,
+        )
+        target_std = float(model_cfg.get("ratings_target_std", 3.0))
+        from fbm.modeling.ratings_fit import normalize_ratings as _norm
+        fitted = _norm(fitted, target_std=target_std)
+        method_used = "bayes"
+    else:
+        hfa_cfg = float(model_cfg.get("hfa_points", 2.0))
+        scale_pts = float(model_cfg.get("sigma_diff", 13.0))
+        elo_k = float(model_cfg.get("elo_k", 20.0))
+        elo_iters = int(model_cfg.get("elo_iters", 2))
+        use_mov = bool(model_cfg.get("mov_enabled", True))
+        mov_scale = float(model_cfg.get("mov_scale_pts", 7.0))
+        mov_cap = float(model_cfg.get("mov_cap", 2.0))
+
+        fitted = fit_elo_ratings(
+            results,
+            start_ratings=starting_ratings,
+            k=elo_k,
+            hfa_points=hfa_cfg,
+            iters=elo_iters,
+            scale_pts=scale_pts,
+            use_mov=use_mov,
+            mov_scale_pts=mov_scale,
+            mov_cap=mov_cap,
+        )
+        target_std = float(model_cfg.get("ratings_target_std", 3.0))
+        fitted = normalize_ratings(fitted, target_std=target_std)
+        method_used = "elo"
+
+    fitted_path = Path(season_silver) / "teams" / f"ratings_fitted_{method_used}.csv"
+    _write_ratings_csv(fitted_path, fitted)
+    print(f"[ratings] fitted ({method_used}): {len(fitted)} saved to {fitted_path}")
+
     model = BaselineModel(
         ratings=fitted,
         hfa_points=float(model_cfg.get("hfa_points", 2.0)),
@@ -125,7 +148,6 @@ def daily(season: int, week: int, league: str, config_path: str):
     )
     league_total_mean = float(model_cfg.get("league_total_mean", 45.0))
 
-    # Load odds
     odds_csv = _ensure_sample_odds_csv(Path(bronze))
     rows = load_odds_csv(odds_csv)
 
@@ -196,21 +218,17 @@ def daily(season: int, week: int, league: str, config_path: str):
             })
 
     out_csv = Path(gold) / "tickets.csv"
-    write_csv(out_csv, tickets, [
-        "game_id","market","side_or_bet","odds_am","odds_dec",
-        "line","fair_prob","model_prob","edge","ev_per_dollar","kelly_stake",
-    ])
+    write_csv(out_csv, tickets, headers)
     print(f"\nSaved {len(tickets)} tickets to {out_csv}")
 
     print("\nPipeline (stub):")
     print(" - ingest odds/schedules -> bronze")
     print(" - normalize -> silver")
-    print(" - fit ratings from results -> season_silver/teams/ratings_fitted.csv")
+    print(" - fit ratings from results -> season_silver/teams/ratings_fitted_{method}.csv")
     print(" - build features -> gold")
     print(" - sample posterior -> probabilities (todo)")
     print(" - compare vs market -> edges + kelly")
     print("Done.")
-    
 
 def main():
     parser = argparse.ArgumentParser(prog="fbm", description="Football Bayesian Model CLI")
@@ -225,7 +243,6 @@ def main():
     args = parser.parse_args()
     if args.cmd == "daily":
         daily(season=args.season, week=args.week, league=args.league, config_path=args.config)
-
 
 if __name__ == "__main__":
     main()
